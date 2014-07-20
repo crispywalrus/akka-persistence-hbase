@@ -1,156 +1,181 @@
 package akka.persistence.hbase.journal
 
+import akka.actor.{ActorLogging, ActorRef, ActorSystem, Props}
 import akka.persistence._
-import akka.testkit.{TestProbe, ImplicitSender, TestKit}
-import akka.actor.{Actor, Props, ActorSystem}
+import akka.persistence.hbase.common.TestingEventProtocol.FinishedDeletes
+import akka.testkit.{ImplicitSender, TestKit, TestProbe}
 import org.scalatest._
+
 import scala.concurrent.duration._
-import org.apache.hadoop.hbase.client.HBaseAdmin
 
 object HBaseAsyncJournalSpec {
 
-  case class Delete(sequenceNr: Long, permanent: Boolean)
+  case class DeleteUntil(sequenceNr: Long, permanent: Boolean)
 
-  class ProcessorA(override val processorId: String) extends Processor {
+  class MyPersistentActor(testActor: ActorRef, override val persistenceId: String) extends PersistentActor with ActorLogging {
 
-    def receive = {
-      case Persistent(payload, sequenceNr) =>
-        sender ! payload
-        sender ! sequenceNr
-        sender ! recoveryRunning
+    val handler: Receive = {
+      case DeleteUntil(nr, permanent) =>
+        log.debug("Deleting messages until {}, permanent: {}", nr, permanent)
+        deleteMessages(toSequenceNr = nr, permanent)
 
-      case Delete(sequenceNr, permanent) =>
-        deleteMessage(sequenceNr, permanent)
+      case RecoveryCompleted => // do nothing...
+
+      case payload if recoveryRunning =>
+        log.debug("Recovering, got [{}] @ {} ({})", payload, currentPersistentMessage.map(_.sequenceNr).get, getCurrentPersistentMessage)
+        testActor ! payload
+        testActor ! currentPersistentMessage.map(_.sequenceNr).get
+        testActor ! recoveryRunning
+
+      case payload =>
+        log.debug("Got payload {}, persisting...", payload)
+
+        persist(payload) { p =>
+          log.debug("Not in recovery, got [{}] @ {}", payload, currentPersistentMessage.map(_.sequenceNr).get)
+          testActor ! payload
+          testActor ! currentPersistentMessage.map(_.sequenceNr).get
+          testActor ! recoveryRunning
+        }
     }
+
+    def receiveCommand = handler
+
+    def receiveRecover = handler
   }
 
-  class ProcessorB(override val processorId: String) extends Processor {
-    val destination = context.actorOf(Props[Destination])
-    val channel = context.actorOf(Channel.props("channel"))
-
-    def receive = {
-      case p: Persistent => channel forward Deliver(p, destination.path)
-    }
-  }
-
-  class Destination extends Actor {
-    def receive = {
-      case cp @ ConfirmablePersistent(payload, sequenceNr, _) =>
-        sender ! s"$payload-$sequenceNr"
-        cp.confirm()
-    }
-  }
 }
 
 class HBaseAsyncJournalSpec extends TestKit(ActorSystem("test")) with ImplicitSender with FlatSpecLike
   with Matchers with BeforeAndAfterAll {
 
-  import HBaseAsyncJournalSpec._
+  import akka.persistence.hbase.journal.HBaseAsyncJournalSpec._
 
   val config = system.settings.config
+
+  val pluginSettings = PersistencePluginSettings(config)
 
   behavior of "HBaseJournal"
 
   val timeout = 5.seconds
 
   override protected def beforeAll() {
-    HBaseJournalInit.createTable(config)
+    super.beforeAll()
+    HBaseJournalInit.createTable(config, pluginSettings.table, pluginSettings.family)
+    HBaseJournalInit.createTable(config, pluginSettings.snapshotTable, pluginSettings.snapshotFamily)
+
+    Thread.sleep(2000)
   }
 
   it should "write and replay messages" in {
-    val processor1 = system.actorOf(Props(classOf[ProcessorA], "p1"))
-    info("p1 = " + processor1)
+    val a1 = system.actorOf(Props(classOf[MyPersistentActor], self, "p1"))
 
-    processor1 ! Persistent("a")
-    processor1 ! Persistent("aa")
+    a1 ! "a"
+    a1 ! "aa"
     expectMsgAllOf(max = timeout, "a", 1L, false)
     expectMsgAllOf(max = timeout, "aa", 2L, false)
 
-    val processor2 = system.actorOf(Props(classOf[ProcessorA], "p1"))
-    processor2 ! Persistent("b")
-    processor2 ! Persistent("c")
+    val a2 = system.actorOf(Props(classOf[MyPersistentActor], self, "p1"))
+    a2 ! "b"
+    a2 ! "c"
     expectMsgAllOf(max = timeout, "a", 1L, true)
     expectMsgAllOf(max = timeout, "aa", 2L, true)
     expectMsgAllOf(max = timeout, "b", 3L, false)
     expectMsgAllOf(max = timeout, "c", 4L, false)
   }
 
-  it should "not replay messages marked as deleted" in {
-    val deleteProbe = TestProbe()
-    subscribeToDeletion(deleteProbe)
-
-    val processor1 = system.actorOf(Props(classOf[ProcessorA], "p2"))
-    processor1 ! Persistent("a")
-    processor1 ! Persistent("b")
-    expectMsgAllOf(max = timeout, "a", 1L, false)
-    expectMsgAllOf(max = timeout, "b", 2L, false)
-    processor1 ! Delete(1L, false)
-
-    awaitDeletion(deleteProbe)
-
-    system.actorOf(Props(classOf[ProcessorA], "p2"))
-    expectMsgAllOf(max = timeout, "b", 2L, true)
-  }
-
   it should "not replay permanently deleted messages" in {
     val deleteProbe = TestProbe()
     subscribeToDeletion(deleteProbe)
 
-    val processor1 = system.actorOf(Props(classOf[ProcessorA], "p3"))
-    processor1 ! Persistent("a")
-    processor1 ! Persistent("b")
+    val a1 = system.actorOf(Props(classOf[MyPersistentActor], self, "p2"))
+    a1 ! "a"
+    a1 ! "b"
+    a1 ! "c"
+    a1 ! "d"
     expectMsgAllOf(max = timeout, "a", 1L, false)
     expectMsgAllOf(max = timeout, "b", 2L, false)
-    processor1 ! Delete(1L, true)
+    expectMsgAllOf(max = timeout, "c", 3L, false)
+    expectMsgAllOf(max = timeout, "d", 4L, false)
+    a1 ! DeleteUntil(2L, permanent = true)
     awaitDeletion(deleteProbe)
 
-    system.actorOf(Props(classOf[ProcessorA], "p3"))
-    expectMsgAllOf("b", 2L, true)
+    val a2 = system.actorOf(Props(classOf[MyPersistentActor], self, "p2"))
+    a2 ! "e"
+    expectMsgAllOf("c", 3L, true)
+    expectMsgAllOf("d", 4L, true)
+    expectMsgAllOf("e", 5L, false)
   }
 
-  it should "write delivery confirmations" in {
-    val confirmProbe = TestProbe()
-    subscribeToConfirmation(confirmProbe)
+  it should "not replay messages marked as deleted" in {
+    val deleteProbe = TestProbe()
+    subscribeToDeletion(deleteProbe)
 
-    val processor1 = system.actorOf(Props(classOf[ProcessorB], "p4"))
-    1L to 8L foreach { i =>
-      processor1 ! Persistent("a")
-      awaitConfirmation(confirmProbe)
-      expectMsg(s"a-$i")
+    val a = system.actorOf(Props(classOf[MyPersistentActor], self, "p3"))
+    a ! "a"
+    a ! "b"
+    expectMsgAllOf(max = timeout, "a", 1L, false)
+    expectMsgAllOf(max = timeout, "b", 2L, false)
+    a ! DeleteUntil(1L, permanent = false)
+
+    awaitDeletion(deleteProbe)
+
+    system.actorOf(Props(classOf[MyPersistentActor], self, "p3"))
+    expectMsgAllOf(max = timeout, "b", 2L, true)
+  }
+
+  lazy val settings = PersistencePluginSettings(system.settings.config)
+
+  it should "delete exactly as much as needed messages" in {
+    val deleteProbe = TestProbe()
+    subscribeToDeletion(deleteProbe)
+
+    val a = system.actorOf(Props(classOf[MyPersistentActor], self, "p4"))
+
+    val partitionRange = 1 to settings.partitionCount
+
+    partitionRange foreach { i =>
+      a ! s"msg-$i"
+      expectMsgAllOf(max = timeout, s"msg-$i", i.toLong, false)
     }
+    a ! "next-1"
+    a ! "next-2"
+    a ! "next-3"
 
-    val processor2 = system.actorOf(Props(classOf[ProcessorB], "p4"))
-    processor2 ! Persistent("b")
-    awaitConfirmation(confirmProbe)
-    expectMsg("b-9")
+    a ! DeleteUntil(partitionRange.size, permanent = true)
+    awaitDeletion(deleteProbe)
+
+    val p2 = TestProbe()
+    system.actorOf(Props(classOf[MyPersistentActor], p2.ref, "p4"))
+    p2.fishForMessage(max = 2.minute, hint = "next-messages") {
+      case "next-1" => false
+      case "next-2" => false
+      case "next-3" => true
+      case b: Boolean => false
+      case n: Long => false
+    }
   }
 
-  // is assured, but no test yet
+//  is assured, but no test yet
   it should "don't apply snapshots the same way as messages" in pending
 
 
-  def subscribeToConfirmation(probe: TestProbe): Unit =
-    system.eventStream.subscribe(probe.ref, classOf[DeliveredByChannel])
-
-  def awaitConfirmation(probe: TestProbe): Unit =
-    probe.expectMsgType[DeliveredByChannel](max = 10.seconds)
-
   def subscribeToDeletion(probe: TestProbe): Unit =
-      system.eventStream.subscribe(probe.ref, classOf[JournalProtocol.DeleteMessages])
+    system.eventStream.subscribe(probe.ref, classOf[FinishedDeletes])
 
   def awaitDeletion(probe: TestProbe): Unit =
-    probe.expectMsgType[JournalProtocol.DeleteMessages](max = 10.seconds)
+    probe.expectMsgType[FinishedDeletes](max = 10.seconds)
 
   override protected def afterAll() {
-    val tableName = config.getString("hbase-journal.table")
+    HBaseJournalInit.disableTable(config, pluginSettings.table)
+    HBaseJournalInit.deleteTable(config, pluginSettings.table)
 
-    val admin = new HBaseAdmin(HBaseJournalInit.getHBaseConfig(config))
-    admin.disableTable(tableName)
-    admin.deleteTable(tableName)
-    admin.close()
+    HBaseJournalInit.disableTable(config, pluginSettings.snapshotTable)
+    HBaseJournalInit.deleteTable(config, pluginSettings.snapshotTable)
 
     HBaseClientFactory.reset()
 
-    system.shutdown()
+    shutdown(system)
+
+    super.afterAll()
   }
 }
